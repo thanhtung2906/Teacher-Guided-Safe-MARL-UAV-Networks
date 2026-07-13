@@ -62,6 +62,10 @@ class UAVEmergencyEnv(ParallelEnv):
         self.eta_LoS = 1 # excessive path-loss components associated with LoS propagation
         self.eta_NLoS = 20 # excessive path-loss components associated with NLoS propagation
 
+
+        self.a = np.zeros((self.num_uavs, self.num_users), dtype=np.int32)    # association indicator
+        self.p = np.zeros((self.num_uavs, self.num_users), dtype=np.float32)  # transmit power
+        self.b = np.zeros((self.num_uavs, self.num_users), dtype=np.float32)  # bandwidth
         
         # 3. Global State Space
         global_state_dim = (self.num_uavs * 2 +  # UAV positions (x, y) H is fixed and energy
@@ -117,6 +121,13 @@ class UAVEmergencyEnv(ParallelEnv):
         return MultiDiscrete([9, 4, 3])
 
     def reset(self, seed=None, options=None):
+        """
+        This function resets the enviroment to new random enviroment 
+        Args:
+            seed: random initialize seed 
+        Returns:
+            new enviroment
+        """
         self.agents = self.possible_agents[:]
 
         if seed is not None:
@@ -154,6 +165,9 @@ class UAVEmergencyEnv(ParallelEnv):
         # Initialize UAV energy levels
         self.uav_energy = np.ones(self.num_uavs) * self.E_max
 
+        self.a = np.zeros((self.num_uavs, self.num_users), dtype=np.int32)
+        self.p = np.zeros((self.num_uavs, self.num_users), dtype=np.float32)
+        self.b = np.zeros((self.num_uavs, self.num_users), dtype=np.float32)
 
         # Return local observations for each UAV
         observations = {agent: self._get_local_obs(agent) for agent in self.agents}
@@ -246,7 +260,7 @@ class UAVEmergencyEnv(ParallelEnv):
         # print("  Closest User Distances (3D):", close_user_distance_3D)
         # print("  Closest User Positions (normalized):", close_user_position)
         # print("  Closest User Weights (normalized):", close_user_weight)    
-        print("  Close user channel gain:" ,close_user_channel_gain)
+        #print("  Close user channel gain:" ,close_user_channel_gain)
 
         # print("self_position_norm shape:", self_position_norm.shape)
         # print("self_energy_norm shape:", self_energy_norm.shape)
@@ -256,7 +270,7 @@ class UAVEmergencyEnv(ParallelEnv):
         # print("close_user_distance_3D shape:", close_user_distance_3D.shape)
         # print("close_user_position shape:", close_user_position.shape)
         # print("close_user_weight shape:", close_user_weight.shape)
-        print("close_user_channel_gain:", close_user_channel_gain.shape)
+        #print("close_user_channel_gain:", close_user_channel_gain.shape)
         # Trả về mảng numpy chứa thông tin của uav đó
         local_obs = np.concatenate([
             self_position_norm,
@@ -284,12 +298,162 @@ class UAVEmergencyEnv(ParallelEnv):
         PLoss = 20 * np.log10 ( 4 * np.pi * self.fc * link_distance / speed_of_light )  + pLoS * self.eta_LoS + pNLoS * self.eta_NLoS #Formula 12
 
         channel_gain = np.power(10,-PLoss/10)
-        return channel_gain
-
-
-
-            
         
+        return channel_gain
+    
+    def _get_nearest_user_indices(self, agent_idx):
+        """
+        Trả về chỉ số của K user gần nhất mà UAV agent_idx quan sát được.
+        Tách riêng từ _get_local_obs để dùng chung với service-group building.
+        """
+        D_MAX = np.sqrt(2 * (self.L ** 2) + (self.H ** 2))
+        uav_pos_norm = self.uav_position[agent_idx] / self.L
+        user_pos_norm = self.user_positions / self.L
+        distances = np.linalg.norm(uav_pos_norm - user_pos_norm, axis=1)
+        sorted_indices = np.argsort(distances)
+        return sorted_indices[:self.max_observed_user]
+
+
+    def _compute_user_score(self, agent_idx, candidate_indices):
+        """
+        Composite score = effective priority weight x channel quality (normalized).
+        Dùng để rank user trước khi chia vào service groups.
+        """
+        weights = self.user_priority[candidate_indices]
+        gains = self._compute_channel_gain(agent_idx, candidate_indices)
+
+        gains_db = 10 * np.log10(gains + 1e-20)
+        g_min, g_max = gains_db.min(), gains_db.max()
+        gains_norm = (gains_db - g_min) / (g_max - g_min + 1e-9)
+        weights_norm = weights / 5.0  # MAX_WEIGHT
+
+        score = weights_norm * gains_norm
+        return score
+
+
+    def _build_service_groups(self, agent_idx, num_groups=4):
+        """
+        Chia K user gần nhất thành `num_groups` candidate group,
+        theo kiểu nested/cumulative: group g = top (g+1)*group_size user tốt nhất.
+        """
+        candidate_indices = self._get_nearest_user_indices(agent_idx)
+        scores = self._compute_user_score(agent_idx, candidate_indices)
+        ranked = candidate_indices[np.argsort(-scores)]  # giảm dần theo score
+
+        K = len(ranked)
+        group_size = max(1, K // num_groups)
+        groups = []
+        for g in range(num_groups):
+            n_users = min(K, (g + 1) * group_size)
+            groups.append(ranked[:n_users])
+        return groups
+
+    def _resolve_association_and_resources(self, actions):
+        """
+        Deterministic control layer: map action -> association (a), power (p), bandwidth (b).
+        Trả về 3 ma trận shape (num_uavs, num_users).
+        Thực hiện công thức (14)-(19) của paper.
+        """
+        M, K = self.num_uavs, self.num_users
+        num_srv_groups = 4   # khớp chiều thứ 2 của MultiDiscrete([9,4,3])
+
+        a = np.zeros((M, K), dtype=np.int32)
+        p = np.zeros((M, K), dtype=np.float32)
+        b = np.zeros((M, K), dtype=np.float32)
+
+        # ---- BƯỚC 1: mỗi UAV chọn service group thô, có thể xung đột ----
+        raw_served = {}  # agent_idx -> array user indices được chọn (trước khi resolve xung đột)
+        for agent in self.agents:
+            m = self.agents.index(agent)
+            _, srv_action, pow_action = actions[agent]
+
+            groups = self._build_service_groups(m, num_srv_groups)
+            served_users = groups[srv_action]
+            raw_served[m] = served_users
+
+            for k in served_users:
+                a[m, k] = 1
+
+        # ---- BƯỚC 2: giải quyết xung đột - ràng buộc (14), mỗi user tối đa 1 UAV ----
+        for k in range(K):
+            serving_uavs = np.where(a[:, k] == 1)[0]
+            if len(serving_uavs) > 1:
+                # user được nhiều UAV chọn -> giữ UAV có channel gain tốt nhất
+                gains = [self._compute_channel_gain(m, np.array([k]))[0] for m in serving_uavs]
+                best_m = serving_uavs[np.argmax(gains)]
+                for m in serving_uavs:
+                    if m != best_m:
+                        a[m, k] = 0
+
+        # ---- BƯỚC 3: cập nhật lại danh sách user thực sự được phục vụ (sau resolve xung đột) ----
+        # rồi phân bổ power/bandwidth - công thức (15)-(19)
+        for agent in self.agents:
+            m = self.agents.index(agent)
+            _, _, pow_action = actions[agent]
+
+            served_users = np.where(a[m, :] == 1)[0]   # danh sách CUỐI CÙNG sau khi resolve xung đột
+            K_m = len(served_users)
+
+            if K_m == 0:
+                continue  # p[m,:] và b[m,:] giữ nguyên 0, đúng yêu cầu paper
+
+            # Power allocation - chia đều trong nhóm, tổng <= P_max (công thức 15, 17)
+            power_levels = self.power_levels  # ví dụ [0.3, 0.6, 1.0], định nghĩa sẵn trong __init__
+            total_power = power_levels[pow_action] * self.P_max
+            power_per_user = total_power / K_m
+            p[m, served_users] = power_per_user
+
+            # Bandwidth allocation - equal sharing, công thức (19)
+            bandwidth_per_user = self.B_m / K_m
+            b[m, served_users] = bandwidth_per_user
+
+        return a, p, b
+
+    def _compute_SINR(self, p, agent_idx, user_indicies):
+        """
+        Compute SINR for user in `user_indicies` when being served by `agent_idx`.
+        p: power matrix, shape (num_uavs, num_users) - p[j, l] = p_{j,l}[t]
+        
+        agent_idx: Serving UAV
+        user_indicies: Users served by UAV agent_idx 
+
+        Return: SINR array, shape (len(user_indicies),) 
+        """
+        # --- Tử số: signal mong muốn từ chính UAV agent_idx ---
+        g_mk = self._compute_channel_gain(agent_idx, user_indicies)      # g_{m,k}, shape (N,)
+        p_mk = p[agent_idx, user_indicies]                                 # p_{m,k}, shape (N,)
+        signal = p_mk * g_mk
+
+        # --- Mẫu số: nhiễu từ các UAV khác (worst-case, theo Remark 1) ---
+        interference = np.zeros(len(user_indicies))
+        for j in range(self.num_uavs):
+            if j == agent_idx:
+                continue
+            total_power_j = np.sum(p[j, :])              # sum_l p_{j,l}[t] - TOÀN BỘ công suất UAV j phát ra
+            g_jk = self._compute_channel_gain(j, user_indicies)   # g_{j,k} - gain từ UAV j đến user k (đang xét)
+            interference += total_power_j * g_jk
+
+        sinr = signal / (interference + self.noise_power)   # sigma^2 = self.noise_power
+        return sinr
+    def _compute_achievable_rate(self, a, p, b):
+        """
+        Tính R_k[t] cho TẤT CẢ user, công thức (21).
+        a, p, b: ma trận association/power/bandwidth đầy đủ, shape (num_uavs, num_users)
+        Trả về: rates, shape (num_users,)
+        """
+        rates = np.zeros(self.num_users)
+
+        for m in range(self.num_uavs):
+            served_users = np.where(a[m, :] == 1)[0]     # user_indicies mà UAV m đang phục vụ
+            if len(served_users) == 0:
+                continue
+
+            sinr = self._compute_SINR(p, m, served_users)      # gamma_{m,k}
+            b_mk = b[m, served_users]                           # bandwidth tương ứng
+            rates[served_users] = b_mk * np.log2(1 + sinr)      # a_{m,k}=1 đã đảm bảo qua served_users
+
+        return rates
+    
     def _move_uav(self, agent_idx, move_action):
         """
         Cập nhật vị trí UAV dựa trên action di chuyển (0-8).
@@ -341,6 +505,7 @@ class UAVEmergencyEnv(ParallelEnv):
         # # shape: (9, 2)
 
         # is_hover = self._move_uav()    
+        move_action, groups_action, power_level_action = actions
 
 
         observations = {agent: self._get_local_obs(agent) for agent in self.agents}
