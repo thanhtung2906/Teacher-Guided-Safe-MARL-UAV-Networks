@@ -44,10 +44,14 @@ class UAVEmergencyEnv(ParallelEnv):
         self.L = 1000  # Size of the environment (L x L)
         self.H = 100   # UAV altitude (fixed)
         self.d_min = 50  # Minimum distance between UAVs to avoid collision
+
         self.E_max = 30  # Maximum energy capacity of UAVs (Kj)
         self.E_min = 5  # Minimum energy threshold for UAVs (Kj)
         
-         
+        self.time_slot = 100 # Mission duration divided into T time slots
+        self.delta_T = 1 # Each time slot duration
+        
+        
         self.uav_position = np.zeros((self.num_uavs, 2))  # UAV positions (x, y)
         self.uav_energy = np.ones(self.num_uavs) * self.E_max  # UAV energy levels (initially full)
         self.user_positions = np.zeros((self.num_users, 2))  # User positions (x, y)
@@ -55,10 +59,13 @@ class UAVEmergencyEnv(ParallelEnv):
 
         self.move_step = 20.0
         self.V_max = 20  # Maximum UAV speed (m/s)
+        self.power_levels = [0.25, 0.5, 1.0]
+        self.B_m = 1e6 # Bandwidth per UAV (Hz)
+        self.P_m = 0.5 # Maximum transmit power (W)
 
         self.alpha_env = 9.61 # Alpha env: enviroment-depent parameter
         self.beta_env = 0.16 # Beta env: enviroment-depent parameter
-        self.fc = 2e9 # Carrier frequency (hz)
+        self.fc = 2e9 # Carrier frequency (Hz)
         self.eta_LoS = 1 # excessive path-loss components associated with LoS propagation
         self.eta_NLoS = 20 # excessive path-loss components associated with NLoS propagation
 
@@ -248,7 +255,9 @@ class UAVEmergencyEnv(ParallelEnv):
 
         # Large-scale channel gain (average of observed users)
 
-        close_user_channel_gain = self._compute_channel_gain(agent_idx, close_indicies)
+        close_user_c_g = self._compute_channel_gain(agent_idx, close_indicies)
+        close_user_c_g_max,close_user_c_g_min = close_user_c_g.max(),close_user_c_g.min()
+        close_user_c_g_norm = (close_user_c_g - close_user_c_g_min) / (close_user_c_g_max - close_user_c_g_min + 1e-9) # Min -  max normalization
 
         # To be continued
                 # print("Local Observation for", agent_id)
@@ -281,7 +290,7 @@ class UAVEmergencyEnv(ParallelEnv):
             close_user_distance_3D,
             close_user_weight,
             close_user_position,
-            close_user_channel_gain
+            close_user_c_g_norm
         ])
         return local_obs
     
@@ -324,7 +333,7 @@ class UAVEmergencyEnv(ParallelEnv):
 
         gains_db = 10 * np.log10(gains + 1e-20)
         g_min, g_max = gains_db.min(), gains_db.max()
-        gains_norm = (gains_db - g_min) / (g_max - g_min + 1e-9)
+        gains_norm = (gains_db - g_min) / (g_max - g_min + 1e-9) #Min max normalize
         weights_norm = weights / 5.0  # MAX_WEIGHT
 
         score = weights_norm * gains_norm
@@ -459,6 +468,11 @@ class UAVEmergencyEnv(ParallelEnv):
         Cập nhật vị trí UAV dựa trên action di chuyển (0-8).
         Trả về: đã di chuyển hay không (để tính năng lượng), vị trí mới đã clip biên
         """
+        # Update UAV positions
+        angles = np.array([0, 45, 90, 135, 180, 225, 270, 315]) * np.pi / 180
+        self.direction_vectors = np.array([[np.cos(a), np.sin(a)] for a in angles])
+        self.direction_vectors = np.vstack([self.direction_vectors, [0.0, 0.0]])  # index 8 = hover shape: (9, 2)
+
         direction = self.direction_vectors[move_action]  # (2,)
         displacement = direction * self.move_step
 
@@ -495,17 +509,7 @@ class UAVEmergencyEnv(ParallelEnv):
         dicts where each dict looks like {agent_1: item_1, agent_2: item_2}
         """
 
-        # Update UAV positions
-
-        # angles = np.array([0, 45, 90, 135, 180, 225, 270, 315]) * np.pi / 180
-        # self.direction_vectors = np.array([
-        #     [np.cos(a), np.sin(a)] for a in angles
-        # ])
-        # self.direction_vectors = np.vstack([self.direction_vectors, [0.0, 0.0]])  # index 8 = hover
-        # # shape: (9, 2)
-
-        # is_hover = self._move_uav()    
-        move_action, groups_action, power_level_action = actions
+        
 
 
         observations = {agent: self._get_local_obs(agent) for agent in self.agents}
@@ -534,8 +538,6 @@ class UAVEmergencyEnv(ParallelEnv):
         return np.zeros(self.state_space.shape, dtype=np.float32)
     
 if __name__ == "__main__":
-    # This is a simple way to test your environment.
-    # It will not be part of the PettingZoo test suite, but can be useful for debugging.
     env = UAVEmergencyEnv(render_mode="human")
     observations, infos = env.reset(seed=42)
 
@@ -543,7 +545,8 @@ if __name__ == "__main__":
     print("Initial Infos:", infos)
     print("Observation space", env.observation_space("uav_0"))
     print("Action space", env.action_space("uav_0"))
-
+    print("User position matrix", env.user_positions)
+    print("User weight matrix", env.user_priority)
 
 
     """print("Observations shape for each UAV:")
