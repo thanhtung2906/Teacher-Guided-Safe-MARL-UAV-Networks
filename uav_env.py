@@ -45,8 +45,8 @@ class UAVEmergencyEnv(ParallelEnv):
         self.H = 100   # UAV altitude (fixed)
         self.d_min = 50  # Minimum distance between UAVs to avoid collision
 
-        self.E_max = 30  # Maximum energy capacity of UAVs (Kj)
-        self.E_min = 5  # Minimum energy threshold for UAVs (Kj)
+        self.E_max = 30000  # Maximum energy capacity of UAVs (Kj)
+        self.E_min = 5000  # Minimum energy threshold for UAVs (Kj)
         
         self.time_slot = 100 # Mission duration divided into T time slots
         self.delta_T = 1 # Each time slot duration
@@ -63,7 +63,8 @@ class UAVEmergencyEnv(ParallelEnv):
         self.B_m = 1e6 # Bandwidth per UAV (Hz)
         self.P_m = 0.5 # Maximum transmit power (W)
 
-
+        
+        self.agent_name_to_idx = {agent: i for i, agent in enumerate(self.possible_agents)} # Mapping agent into index
         self.P0 = 79.86 # Blade profile power (W)
         self.Pi = 88.63 # Induced power (W)
         self.Utip = 120 # Rotor blade tip speed (m/s)
@@ -187,12 +188,15 @@ class UAVEmergencyEnv(ParallelEnv):
                 if all(np.linalg.norm(position - self.uav_position[j]) >= self.d_min for j in range(i)):
                     self.uav_position[i] = position
                     break
+        
         # Initialize UAV energy levels
         self.uav_energy = np.ones(self.num_uavs) * self.E_max
 
         self.a = np.zeros((self.num_uavs, self.num_users), dtype=np.int32)
         self.p = np.zeros((self.num_uavs, self.num_users), dtype=np.float32)
         self.b = np.zeros((self.num_uavs, self.num_users), dtype=np.float32)
+
+        self.current_step = 0
 
         # Return local observations for each UAV
         observations = {agent: self._get_local_obs(agent) for agent in self.agents}
@@ -226,7 +230,7 @@ class UAVEmergencyEnv(ParallelEnv):
             close_user_weight: The normalized urgency weights of the closest observed users.  shape (max_observed_user,1)
 
         """
-        agent_idx = self.agents.index(agent_id)
+        agent_idx = self.agent_name_to_idx[agent_id]
         MAX_WEIGHT = 5.0
         D_MAX = np.sqrt(2 * (self.L ** 2) + (self.H ** 2))  # Maximum possible distance in the environment
         # Local Observation
@@ -235,8 +239,7 @@ class UAVEmergencyEnv(ParallelEnv):
         self_position_norm = self.uav_position[agent_idx] / self.L  
 
         # Normalize UAV energy [0,1]
-        self_energy_norm = np.array([self.uav_energy[agent_idx] / self.E_max])
-
+        self_energy_norm = np.array([self.uav_energy[agent_idx] / self.E_max]) 
         # User positions (x, y)
         self_user_positions = self.user_positions / self.L  
 
@@ -259,13 +262,14 @@ class UAVEmergencyEnv(ParallelEnv):
 
 
         
-        distances = np.linalg.norm(self_position_norm - self_user_positions, axis=1) 
+        distances = np.linalg.norm(self.uav_position[agent_idx]- self.user_positions, axis=1) 
 
         sorted_indices = np.argsort(distances)
         close_indicies = sorted_indices[:self.max_observed_user]
         
         close_user_distance = distances[close_indicies] # Shape [max_observed_user]
         close_user_distance_3D = np.hypot(close_user_distance, self.H) / D_MAX  # Normalize 3D distance [0,1]
+        
         close_user_weight = self.user_priority[close_indicies] / MAX_WEIGHT  # Normalize user urgency weight [0,1]
         close_user_position = self_user_positions[close_indicies].flatten()  # User positions [0,1]
 
@@ -298,7 +302,9 @@ class UAVEmergencyEnv(ParallelEnv):
         # print("close_user_position shape:", close_user_position.shape)
         # print("close_user_weight shape:", close_user_weight.shape)
         #print("close_user_channel_gain:", close_user_channel_gain.shape)
+        #print("UAV Energy", self.uav_energy)
         # Trả về mảng numpy chứa thông tin của uav đó
+
         local_obs = np.concatenate([
             self_position_norm,
             self_energy_norm,
@@ -392,7 +398,7 @@ class UAVEmergencyEnv(ParallelEnv):
         # ---- BƯỚC 1: mỗi UAV chọn service group thô, có thể xung đột ----
         raw_served = {}  # agent_idx -> array user indices được chọn (trước khi resolve xung đột)
         for agent in self.agents:
-            m = self.agents.index(agent)
+            m = self.agent_name_to_idx[agent]
             _, srv_action, pow_action = actions[agent]
 
             groups = self._build_service_groups(m, num_srv_groups)
@@ -416,7 +422,7 @@ class UAVEmergencyEnv(ParallelEnv):
         # ---- BƯỚC 3: cập nhật lại danh sách user thực sự được phục vụ (sau resolve xung đột) ----
         # rồi phân bổ power/bandwidth - công thức (15)-(19)
         for agent in self.agents:
-            m = self.agents.index(agent)
+            m = self.agent_name_to_idx[agent]
             _, _, pow_action = actions[agent]
 
             served_users = np.where(a[m, :] == 1)[0]   # danh sách CUỐI CÙNG sau khi resolve xung đột
@@ -436,15 +442,15 @@ class UAVEmergencyEnv(ParallelEnv):
             b[m, served_users] = bandwidth_per_user
 
         return a, p, b
-    def _compute_noise_power(self,agent_idx,user_indicies,b):
+    def _compute_noise_power(self, agent_idx, user_indicies, b):
         """
         Compute noise power from uav m to user k
         noise_power = b_m,k * noise_psd 
         """
-        b_m_k = b[agent_idx,user_indicies]
-        noise_power = self.noise_PSD * b_m_k
+        b_m_k = b[agent_idx, user_indicies]  # Hz
+        noise_psd_linear = 10 ** (self.noise_PSD / 10) * 1e-3   # dBm -> W/Hz
+        noise_power = noise_psd_linear * b_m_k                    # W
         return noise_power
-    
     def _compute_SINR(self, p, b, agent_idx, user_indicies):
         """
         Compute SINR for user in `user_indicies` when being served by `agent_idx`.
@@ -568,8 +574,7 @@ class UAVEmergencyEnv(ParallelEnv):
             # Cập nhật năng lượng còn lại - công thức (26)
             self.uav_energy[m] = self.uav_energy[m] - E_total
             self.uav_energy[m] = max(0.0, self.uav_energy[m])  # không cho âm
-
-
+            #print("UAV Energy", self.uav_energy[m])
 
     def step(self, actions):
         # Execute actions for all UAVs simultaneously
@@ -585,7 +590,7 @@ class UAVEmergencyEnv(ParallelEnv):
         """
         speeds = np.zeros(self.num_uavs)
         for agent in self.agents:
-            agent_idx = self.agents.index(agent)
+            agent_idx = self.agent_name_to_idx[agent]
             mov_action = actions[agent][0]
             speeds[agent_idx] = self._move_uav(agent_idx, mov_action)   
         a, p, b = self._resolve_association_and_resources(actions)   # gọi 1 LẦN duy nhất
@@ -594,21 +599,26 @@ class UAVEmergencyEnv(ParallelEnv):
 
         rates = self._compute_achievable_rate(a, p, b)
 
-
         
-
 
         observations = {agent: self._get_local_obs(agent) for agent in self.agents}
         
         # Trả về phần thưởng chung hoặc riêng tùy định nghĩa (Thường trong CTDE là chung)
         rewards = {agent: 0.0 for agent in self.agents} 
-        
-        terminations = {agent: False for agent in self.agents}
-        truncations = {agent: False for agent in self.agents}
-        infos = {agent: {} for agent in self.agents}
+        self.current_step += 1
+        terminations = {}
+        truncations = {}
+        for agent in self.agents:
+            agent_idx = self.agents.index(agent)
+            terminations[agent] = bool(self.uav_energy[agent_idx] <= self.E_min)
+            truncations[agent] = bool(self.current_step >= self.time_slot)
 
-        # Nếu một agent bị loại bỏ (ví dụ: hết pin), hãy xóa nó khỏi self.agents
-        
+        infos = {agent: {} for agent in self.agents}
+        self.agents = [
+            agent for agent in self.agents
+            if not (terminations[agent] or truncations[agent])
+        ]
+
         return observations, rewards, terminations, truncations, infos
 
 
@@ -624,29 +634,6 @@ class UAVEmergencyEnv(ParallelEnv):
         return np.zeros(self.state_space.shape, dtype=np.float32)
     
 if __name__ == "__main__":
-
-    """
-    print("Initial Observations:", observations)
-    print("Initial Infos:", infos)
-    print("Observation space", env.observation_space("uav_0"))
-    print("Action space", env.action_space("uav_0"))
-    print("User position matrix", env.user_positions)
-    print("User weight matrix", env.user_priority)
-
-
-    print("Observations shape for each UAV:")
-    for agent, obs in observations.items():
-        print(f"  {agent}: {obs.shape}")
-
-    print("Action space UAV 1:", env.action_space("uav_0"))
-
-    while env.agents:
-        # this is where you would insert your policy
-        actions = {agent: env.action_space(agent).sample() for agent in env.agents}
-
-        observations, rewards, terminations, truncations, infos = env.step(actions)"""
-
-
 
     env = UAVEmergencyEnv(render_mode="human")
     obs, infos = env.reset(seed=42)
@@ -667,9 +654,10 @@ if __name__ == "__main__":
 
         assert env.observation_space(agent).contains(obs.astype(np.float32))
 
-    obs, infos = env.reset(seed=42)
 
-    for step in range(20):
+    for step in range(env.time_slot):
+        if not env.agents:
+            break
         actions = {
             agent: env.action_space(agent).sample()
             for agent in env.agents
