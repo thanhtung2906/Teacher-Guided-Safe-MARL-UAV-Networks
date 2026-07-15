@@ -57,18 +57,33 @@ class UAVEmergencyEnv(ParallelEnv):
         self.user_positions = np.zeros((self.num_users, 2))  # User positions (x, y)
         self.user_priority = np.zeros(self.num_users)  # User urgency weights (to be defined)
 
-        self.move_step = 20.0
-        self.V_max = 20  # Maximum UAV speed (m/s)
+        self.V_step = 10.0
+        self.V_max = 20.0  # Maximum UAV speed (m/s)
         self.power_levels = [0.25, 0.5, 1.0]
         self.B_m = 1e6 # Bandwidth per UAV (Hz)
         self.P_m = 0.5 # Maximum transmit power (W)
+
+
+        self.P0 = 79.86 # Blade profile power (W)
+        self.Pi = 88.63 # Induced power (W)
+        self.Utip = 120 # Rotor blade tip speed (m/s)
+        self.v0 = 4.03 # Mean induced velocity (m/s)
+        self.d0 = 0.6 # Fuselage drag ratio 
+        self.rho = 1.225 # Air density (kg/m3)
+        self.s = 0.05 # Rotor solidity
+        self.A = 0.503 # Rotor disc area
 
         self.alpha_env = 9.61 # Alpha env: enviroment-depent parameter
         self.beta_env = 0.16 # Beta env: enviroment-depent parameter
         self.fc = 2e9 # Carrier frequency (Hz)
         self.eta_LoS = 1 # excessive path-loss components associated with LoS propagation
         self.eta_NLoS = 20 # excessive path-loss components associated with NLoS propagation
+        self.noise_PSD = -174 # Noise PSD dBm/Hz
 
+
+        self.angles = np.array([0, 45, 90, 135, 180, 225, 270, 315]) * np.pi / 180
+        self.direction_vectors = np.array([[np.cos(a), np.sin(a)] for a in self.angles])
+        self.direction_vectors = np.vstack([self.direction_vectors, [0.0, 0.0]])  # index 8 = hover, shape (9,2)
 
         self.a = np.zeros((self.num_uavs, self.num_users), dtype=np.int32)    # association indicator
         self.p = np.zeros((self.num_uavs, self.num_users), dtype=np.float32)  # transmit power
@@ -103,7 +118,10 @@ class UAVEmergencyEnv(ParallelEnv):
         
         users_dim = self.max_observed_user * 4      # User: distance_3D (1) + position (2) + weight (1) = 4
         
-        self.obs_dim = self_dim + other_uavs_dim + users_dim 
+        channel_gain_dim = self.max_observed_user * 1 # Channel gain: channel_gain (1)
+        self.obs_dim = self_dim + other_uavs_dim + users_dim + channel_gain_dim
+
+
 
         return Box(
             low=-np.inf, 
@@ -294,6 +312,7 @@ class UAVEmergencyEnv(ParallelEnv):
         ])
         return local_obs
     
+
     def _compute_channel_gain(self,agent_idx,user_indicies):
         
         horizontal_distance = np.linalg.norm(self.uav_position[agent_idx] - self.user_positions[user_indicies],axis = 1) 
@@ -408,7 +427,7 @@ class UAVEmergencyEnv(ParallelEnv):
 
             # Power allocation - chia đều trong nhóm, tổng <= P_max (công thức 15, 17)
             power_levels = self.power_levels  # ví dụ [0.3, 0.6, 1.0], định nghĩa sẵn trong __init__
-            total_power = power_levels[pow_action] * self.P_max
+            total_power = power_levels[pow_action] * self.P_m
             power_per_user = total_power / K_m
             p[m, served_users] = power_per_user
 
@@ -417,8 +436,16 @@ class UAVEmergencyEnv(ParallelEnv):
             b[m, served_users] = bandwidth_per_user
 
         return a, p, b
-
-    def _compute_SINR(self, p, agent_idx, user_indicies):
+    def _compute_noise_power(self,agent_idx,user_indicies,b):
+        """
+        Compute noise power from uav m to user k
+        noise_power = b_m,k * noise_psd 
+        """
+        b_m_k = b[agent_idx,user_indicies]
+        noise_power = self.noise_PSD * b_m_k
+        return noise_power
+    
+    def _compute_SINR(self, p, b, agent_idx, user_indicies):
         """
         Compute SINR for user in `user_indicies` when being served by `agent_idx`.
         p: power matrix, shape (num_uavs, num_users) - p[j, l] = p_{j,l}[t]
@@ -428,6 +455,7 @@ class UAVEmergencyEnv(ParallelEnv):
 
         Return: SINR array, shape (len(user_indicies),) 
         """
+        noise_power = self._compute_noise_power(agent_idx, user_indicies, b)
         # --- Tử số: signal mong muốn từ chính UAV agent_idx ---
         g_mk = self._compute_channel_gain(agent_idx, user_indicies)      # g_{m,k}, shape (N,)
         p_mk = p[agent_idx, user_indicies]                                 # p_{m,k}, shape (N,)
@@ -442,7 +470,7 @@ class UAVEmergencyEnv(ParallelEnv):
             g_jk = self._compute_channel_gain(j, user_indicies)   # g_{j,k} - gain từ UAV j đến user k (đang xét)
             interference += total_power_j * g_jk
 
-        sinr = signal / (interference + self.noise_power)   # sigma^2 = self.noise_power
+        sinr = signal / (interference + noise_power)   # sigma^2 = self.noise_power
         return sinr
     def _compute_achievable_rate(self, a, p, b):
         """
@@ -457,44 +485,91 @@ class UAVEmergencyEnv(ParallelEnv):
             if len(served_users) == 0:
                 continue
 
-            sinr = self._compute_SINR(p, m, served_users)      # gamma_{m,k}
+            sinr = self._compute_SINR(p,b, m, served_users)      # gamma_{m,k}
             b_mk = b[m, served_users]                           # bandwidth tương ứng
             rates[served_users] = b_mk * np.log2(1 + sinr)      # a_{m,k}=1 đã đảm bảo qua served_users
 
         return rates
     
-    def _move_uav(self, agent_idx, move_action):
+    def _move_uav(self, agent_idx, mov_action):
         """
         Cập nhật vị trí UAV dựa trên action di chuyển (0-8).
-        Trả về: đã di chuyển hay không (để tính năng lượng), vị trí mới đã clip biên
+        Trả về: speed thực tế (m/s) sau khi đã áp dụng ràng buộc biên (7).
         """
-        # Update UAV positions
-        angles = np.array([0, 45, 90, 135, 180, 225, 270, 315]) * np.pi / 180
-        self.direction_vectors = np.array([[np.cos(a), np.sin(a)] for a in angles])
-        self.direction_vectors = np.vstack([self.direction_vectors, [0.0, 0.0]])  # index 8 = hover shape: (9, 2)
+        is_hover = (mov_action == 8)
 
-        direction = self.direction_vectors[move_action]  # (2,)
-        displacement = direction * self.move_step
+        direction_vec = self.direction_vectors[mov_action]   # (2,)
+        displacement = direction_vec * self.V_step
 
-        new_position = self.uav_position[agent_idx] + displacement
+        old_position = self.uav_position[agent_idx].copy()
+        new_position = old_position + displacement
+        new_position = np.clip(new_position, 0, self.L)      # ràng buộc (7) - KHÔNG nên bỏ
 
-        # Giới hạn trong biên [0, L] x [0, L]
-        new_position = np.clip(new_position, 0, self.L)
-
-        is_hover = (move_action == 8)
         self.uav_position[agent_idx] = new_position
 
-        return is_hover
-    
-    def _update_energy(self, agent_idx, is_hover, transmit_power_level):
-        # Năng lượng di chuyển (bay tốn nhiều hơn hover)
-        move_energy_cost = 0.05 if is_hover else 0.15  # Kj/slot, cần tune theo bài báo gốc
-        
-        # Năng lượng truyền dữ liệu - phụ thuộc action thứ 3 (mức công suất phát)
-        transmit_energy_cost = 0.02 * (transmit_power_level + 1)  # ví dụ tuyến tính
+        # Speed thực tế theo công thức (5), tính TỪ vị trí thực tế sau clip
+        actual_displacement = np.linalg.norm(new_position - old_position)
+        speed = actual_displacement / self.delta_T
 
-        total_cost = move_energy_cost + transmit_energy_cost
-        self.uav_energy[agent_idx] = max(0.0, self.uav_energy[agent_idx] - total_cost)
+        return speed
+    
+    def _transmit_energy(self,agent_idx,p): 
+        """
+        Formula 23
+        E_tx = deltaT * sum_k p(m,k)t
+        Args:
+            agent_idx: agent index
+            p: power matrix of all UAVs and all users
+        Returns:
+            E_tx: Total transmit energy of all user K transmit by UAV m
+        """
+
+        total_energy = np.sum(p[agent_idx,:])
+        E_tx = total_energy * self.delta_T
+        return E_tx
+
+    def _propulsion_power(self, v):
+        """
+        Formula (24) - rotary-wing UAV propulsion power model.
+        Args:
+            v: UAV speed (m/s)
+        Return:
+            P_fly: Propulsion power (W)
+        """
+        # Số hạng 1: blade profile power 
+        term1 = self.P0 * (1 + 3 * v**2 / self.Utip**2)
+
+        # Số hạng 2: induced power 
+        inner = np.sqrt(1 + v**4 / (4 * self.v0**4)) - v**2 / (2 * self.v0**2)
+        term2 = self.Pi * np.sqrt(inner)
+
+        # Số hạng 3: parasite/fuselage drag power 
+        term3 = 0.5 * self.d0 * self.rho * self.s * self.A * v**3
+
+        P_fly = term1 + term2 + term3
+        return P_fly
+    def _update_energy(self, a, p, speeds):
+        """
+        Cập nhật năng lượng cho TẤT CẢ UAV sau 1 slot.
+        a, p: ma trận association/power đã tính 1 LẦN ở đầu step() (không tính lại ở đây)
+        speeds: array shape (num_uavs,) - tốc độ v_m[t] của từng UAV, lấy từ _move_uav
+        """
+        for m in range(self.num_uavs):
+            # Propulsion energy - công thức (24), (25)
+            P_fly = self._propulsion_power(speeds[m])
+            E_fly = P_fly * self.delta_T
+
+            # Transmit energy - công thức (23)
+            E_tx = self._transmit_energy(m, p)
+
+            # Tổng năng lượng tiêu thụ slot này - công thức (22)
+            E_total = E_fly + E_tx
+
+            # Cập nhật năng lượng còn lại - công thức (26)
+            self.uav_energy[m] = self.uav_energy[m] - E_total
+            self.uav_energy[m] = max(0.0, self.uav_energy[m])  # không cho âm
+
+
 
     def step(self, actions):
         # Execute actions for all UAVs simultaneously
@@ -508,6 +583,17 @@ class UAVEmergencyEnv(ParallelEnv):
         - infos
         dicts where each dict looks like {agent_1: item_1, agent_2: item_2}
         """
+        speeds = np.zeros(self.num_uavs)
+        for agent in self.agents:
+            agent_idx = self.agents.index(agent)
+            mov_action = actions[agent][0]
+            speeds[agent_idx] = self._move_uav(agent_idx, mov_action)   
+        a, p, b = self._resolve_association_and_resources(actions)   # gọi 1 LẦN duy nhất
+
+        self._update_energy(a, p, speeds)   # dùng lại a, p đã tính, không tính lại
+
+        rates = self._compute_achievable_rate(a, p, b)
+
 
         
 
@@ -538,9 +624,8 @@ class UAVEmergencyEnv(ParallelEnv):
         return np.zeros(self.state_space.shape, dtype=np.float32)
     
 if __name__ == "__main__":
-    env = UAVEmergencyEnv(render_mode="human")
-    observations, infos = env.reset(seed=42)
 
+    """
     print("Initial Observations:", observations)
     print("Initial Infos:", infos)
     print("Observation space", env.observation_space("uav_0"))
@@ -549,7 +634,7 @@ if __name__ == "__main__":
     print("User weight matrix", env.user_priority)
 
 
-    """print("Observations shape for each UAV:")
+    print("Observations shape for each UAV:")
     for agent, obs in observations.items():
         print(f"  {agent}: {obs.shape}")
 
@@ -563,3 +648,40 @@ if __name__ == "__main__":
 
 
 
+    env = UAVEmergencyEnv(render_mode="human")
+    obs, infos = env.reset(seed=42)
+
+    print("Agents:", env.agents)
+    print("Number of agents:", len(env.agents))
+    print()
+
+    for agent, ob in obs.items():
+        print(agent, ob.shape)
+
+    for agent in env.agents:
+        obs = env._get_local_obs(agent)
+
+        print(agent)
+        print(obs.shape)
+        print(env.observation_space(agent).shape)
+
+        assert env.observation_space(agent).contains(obs.astype(np.float32))
+
+    obs, infos = env.reset(seed=42)
+
+    for step in range(20):
+        actions = {
+            agent: env.action_space(agent).sample()
+            for agent in env.agents
+        }
+
+        obs, rewards, terminations, truncations, infos = env.step(actions)
+
+        print(f"\n========== STEP {step} ==========")
+
+        for agent in env.agents:
+            print(f"\n{agent}")
+            print("Action :", actions[agent])
+            print("Reward :", rewards[agent])
+            print("Obs :", obs[agent])
+            print("Obs shape :", obs[agent].shape)
