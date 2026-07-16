@@ -45,8 +45,8 @@ class UAVEmergencyEnv(ParallelEnv):
         self.H = 100   # UAV altitude (fixed)
         self.d_min = 50  # Minimum distance between UAVs to avoid collision
 
-        self.E_max = 30000  # Maximum energy capacity of UAVs (Kj)
-        self.E_min = 5000  # Minimum energy threshold for UAVs (Kj)
+        self.E_max = 30000  # Maximum energy capacity of UAVs (j)
+        self.E_min = 5000  # Minimum energy threshold for UAVs (j)
         
         self.time_slot = 100 # Mission duration divided into T time slots
         self.delta_T = 1 # Each time slot duration
@@ -81,6 +81,19 @@ class UAVEmergencyEnv(ParallelEnv):
         self.eta_NLoS = 20 # excessive path-loss components associated with NLoS propagation
         self.noise_PSD = -174 # Noise PSD dBm/Hz
 
+
+        # Reward coefficients - Formula (35)
+        self.lambda_E = 1e5   # hệ số phạt năng lượng (cần scale vì E tính bằng J, R tính bằng bps)
+        self.lambda_Q = 1.0    # hệ số phạt vi phạm QoS khẩn cấp
+        self.lambda_C = 1.0    # hệ số phạt va chạm
+        self.lambda_B = 1.0    # hệ số phạt pin cạn
+
+        self.consumed_energy = np.zeros(num_uavs)
+        # QoS threshold cho user khẩn cấp - dùng trong (31h), (32)
+        self.R_min_emg = 1e5   # bps, giá trị cụ thể bạn cần chọn theo thực nghiệm
+
+        # Đánh dấu user nào là "khẩn cấp" (K_emg ⊆ K)
+        self.is_emergency = None  # sẽ set trong reset(), ví dụ user có weight=5
 
         self.angles = np.array([0, 45, 90, 135, 180, 225, 270, 315]) * np.pi / 180
         self.direction_vectors = np.array([[np.cos(a), np.sin(a)] for a in self.angles])
@@ -161,7 +174,8 @@ class UAVEmergencyEnv(ParallelEnv):
         
         # Initialize the environment state 
         # User positions are randomly distributed in the environment
-        self.user_positions = np.random.uniform(0, self.L, size=(self.num_users, 2)) 
+        self.user_positions = np.random.uniform(0, self.L, size=(self.num_users, 2)) \
+
         user_wk5 = int(0.20 * self.num_users)                                                 # Number of users with urgency weight 5
         user_wk2 = int(0.30 * self.num_users)                                                 # Number of users with urgency weight 2
         user_wk1 = self.num_users - user_wk5 - user_wk2                                       # Number of users with urgency weight 1
@@ -169,7 +183,7 @@ class UAVEmergencyEnv(ParallelEnv):
         weights = ([5.0] * user_wk5) + ([2.0] * user_wk2) + ([1.0] * user_wk1)
         np.random.shuffle(weights)  # Shuffle the weights to randomize user urgency
         self.user_priority = np.array(weights)
-
+        self.is_emergency = (self.user_priority == 5.0)
         # Initialize UAV positions randomly within the environment
         # for i in range(self.num_uavs):
         #     valid_position = False
@@ -570,11 +584,45 @@ class UAVEmergencyEnv(ParallelEnv):
 
             # Tổng năng lượng tiêu thụ slot này - công thức (22)
             E_total = E_fly + E_tx
-
+            self.consumed_energy[m] = E_total
             # Cập nhật năng lượng còn lại - công thức (26)
-            self.uav_energy[m] = self.uav_energy[m] - E_total
-            self.uav_energy[m] = max(0.0, self.uav_energy[m])  # không cho âm
+            self.uav_energy[m] = max(0.0, self.uav_energy[m] - E_total)  # không cho âm
             #print("UAV Energy", self.uav_energy[m])
+
+        return self.consumed_energy # Trả về năng lượng đã tiêu hao sử dụng
+        
+    def _compute_qos_violation(self, rates):
+        """Formula (32): chỉ tính cho user khẩn cấp"""
+        emg_rates = rates[self.is_emergency]
+        psi_qos = np.maximum(self.R_min_emg - emg_rates, 0.0)
+        return psi_qos  # shape (num_emg_users,)
+
+    def _compute_collision_violation(self):
+        """Formula (33): với mọi cặp UAV m != j"""
+        psi_col = 0.0
+        for m in range(self.num_uavs):
+            for j in range(m + 1, self.num_uavs):   # chỉ tính mỗi cặp 1 lần, x2 sau
+                dist = np.linalg.norm(self.uav_position[m] - self.uav_position[j])
+                psi_col += 2 * max(self.d_min - dist, 0.0)  # x2 vì sum m!=j đếm cả (m,j) và (j,m)
+        return psi_col
+
+    def _compute_battery_violation(self):
+        """Formula (34)"""
+        psi_bat = np.maximum(self.E_min - self.uav_energy, 0.0)
+        return psi_bat  # shape (num_uavs,)
+    
+    def _compute_reward(self, a, rates, E_consumed, psi_qos, psi_col, psi_bat):
+        U_R = np.sum(self.user_priority * rates * a.sum(axis=0))  
+        # a.sum(axis=0) = 1 nếu user được phục vụ, 0 nếu không -> mask user chưa có UAV nào phục vụ
+
+        U_E = np.sum(E_consumed)
+
+        penalty_qos = self.lambda_Q * np.sum(psi_qos)
+        penalty_col = self.lambda_C * psi_col
+        penalty_bat = self.lambda_B * np.sum(psi_bat)
+
+        r = U_R - self.lambda_E * U_E - penalty_qos - penalty_col - penalty_bat
+        return r
 
     def step(self, actions):
         # Execute actions for all UAVs simultaneously
@@ -595,16 +643,19 @@ class UAVEmergencyEnv(ParallelEnv):
             speeds[agent_idx] = self._move_uav(agent_idx, mov_action)   
         a, p, b = self._resolve_association_and_resources(actions)   # gọi 1 LẦN duy nhất
 
-        self._update_energy(a, p, speeds)   # dùng lại a, p đã tính, không tính lại
+        E_consumed = self._update_energy(a, p, speeds)   # dùng lại a, p đã tính, không tính lại
 
         rates = self._compute_achievable_rate(a, p, b)
 
-        
+        psi_qos = self._compute_qos_violation(rates)             # (32)
+        psi_col = self._compute_collision_violation()             # (33)
+        psi_bat = self._compute_battery_violation( )                # (34)
 
         observations = {agent: self._get_local_obs(agent) for agent in self.agents}
         
+        r_shared = self._compute_reward(a, rates, E_consumed, psi_qos, psi_col, psi_bat)  # (35)
         # Trả về phần thưởng chung hoặc riêng tùy định nghĩa (Thường trong CTDE là chung)
-        rewards = {agent: 0.0 for agent in self.agents} 
+        rewards = {agent: r_shared for agent in self.agents} 
         self.current_step += 1
         terminations = {}
         truncations = {}
@@ -613,7 +664,11 @@ class UAVEmergencyEnv(ParallelEnv):
             terminations[agent] = bool(self.uav_energy[agent_idx] <= self.E_min)
             truncations[agent] = bool(self.current_step >= self.time_slot)
 
-        infos = {agent: {} for agent in self.agents}
+        infos = {agent: {
+        "psi_qos_sum": float(np.sum(psi_qos)),
+        "psi_col": float(psi_col),
+        "psi_bat_sum": float(np.sum(psi_bat)),
+        } for agent in self.agents}
         self.agents = [
             agent for agent in self.agents
             if not (terminations[agent] or truncations[agent])
@@ -624,14 +679,18 @@ class UAVEmergencyEnv(ParallelEnv):
 
 
     def state(self):
-        """
-        Xây dựng s[t]: Phương thức cốt lõi cho CTDE trong PettingZoo.
-        Trả về trạng thái toàn cục để nạp vào Centralized Critic.
-        """
+        close_gains = np.array([
+            self._compute_channel_gain(0, np.arange(self.num_users))
+        ]).flatten()  # ví dụ đơn giản, bạn cần quyết định channel gain tính theo UAV nào / trung bình ra sao
 
-        
-        # Trộn tất cả thông tin toàn cục thành một mảng 1D duy nhất
-        return np.zeros(self.state_space.shape, dtype=np.float32)
+        global_state = np.concatenate([
+            self.uav_position.flatten() / self.L,      # (num_uavs*2,)
+            self.uav_energy / self.E_max,               # (num_uavs,)
+            self.user_positions.flatten() / self.L,     # (num_users*2,)
+            self.user_priority / 5.0,                    # (num_users,)
+            close_gains                                  # (num_users,) - cần định nghĩa lại cho hợp lý
+        ])
+        return global_state.astype(np.float32)
     
 if __name__ == "__main__":
 
@@ -673,3 +732,4 @@ if __name__ == "__main__":
             print("Reward :", rewards[agent])
             print("Obs :", obs[agent])
             print("Obs shape :", obs[agent].shape)
+            print("Global Observation", env.state())
