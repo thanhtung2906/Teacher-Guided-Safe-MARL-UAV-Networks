@@ -44,9 +44,11 @@ class UAVEmergencyEnv(ParallelEnv):
         self.L = 1000  # Size of the environment (L x L)
         self.H = 100   # UAV altitude (fixed)
         self.d_min = 50  # Minimum distance between UAVs to avoid collision
+        self.D_MAX = np.sqrt(2 * (self.L ** 2) + (self.H ** 2)) # Maximum possible distance in (L x L) enviroment
 
-        self.E_max = 30000  # Maximum energy capacity of UAVs (j)
-        self.E_min = 5000  # Minimum energy threshold for UAVs (j)
+        self.E_max = 30000  # Maximum energy capacity of UAVs (Joules)
+        self.E_min = 5000  # Minimum energy threshold for UAVs (Joules)
+        
         
         self.time_slot = 100 # Mission duration divided into T time slots
         self.delta_T = 1 # Each time slot duration
@@ -62,7 +64,7 @@ class UAVEmergencyEnv(ParallelEnv):
         self.power_levels = [0.25, 0.5, 1.0]
         self.B_m = 1e6 # Bandwidth per UAV (Hz)
         self.P_m = 0.5 # Maximum transmit power (W)
-
+        self._renderer = None
         
         self.agent_name_to_idx = {agent: i for i, agent in enumerate(self.possible_agents)} # Mapping agent into index
         self.P0 = 79.86 # Blade profile power (W)
@@ -81,16 +83,15 @@ class UAVEmergencyEnv(ParallelEnv):
         self.eta_NLoS = 20 # excessive path-loss components associated with NLoS propagation
         self.noise_PSD = -174 # Noise PSD dBm/Hz
 
-
         # Reward coefficients - Formula (35)
-        self.lambda_E = 1e5   # hệ số phạt năng lượng (cần scale vì E tính bằng J, R tính bằng bps)
-        self.lambda_Q = 1.0    # hệ số phạt vi phạm QoS khẩn cấp
-        self.lambda_C = 1.0    # hệ số phạt va chạm
-        self.lambda_B = 1.0    # hệ số phạt pin cạn
-
+        self.lambda_E = 30   # hệ số phạt năng lượng (cần scale vì E tính bằng J, R tính bằng bps)
+        self.lambda_Q = 100    # hệ số phạt vi phạm QoS khẩn cấp
+        self.lambda_C = 30    # hệ số phạt va chạm
+        self.lambda_B = 30    # hệ số phạt pin cạn
+        self._cumulative_reward = 0.0
         self.consumed_energy = np.zeros(num_uavs)
         # QoS threshold cho user khẩn cấp - dùng trong (31h), (32)
-        self.R_min_emg = 1e5   # bps, giá trị cụ thể bạn cần chọn theo thực nghiệm
+        self.R_min_emg = 0.1   # bps, giá trị cụ thể bạn cần chọn theo thực nghiệm
 
         # Đánh dấu user nào là "khẩn cấp" (K_emg ⊆ K)
         self.is_emergency = None  # sẽ set trong reset(), ví dụ user có weight=5
@@ -103,6 +104,10 @@ class UAVEmergencyEnv(ParallelEnv):
         self.p = np.zeros((self.num_uavs, self.num_users), dtype=np.float32)  # transmit power
         self.b = np.zeros((self.num_uavs, self.num_users), dtype=np.float32)  # bandwidth
         
+        gain_max , gain_min = self._channel_gain_bounds() # Gain max min according to D_max and H
+        self.gain_max_db = 10 * np.log10(gain_max) # Convert into db
+        self.gain_min_db = 10 * np.log10(gain_min)
+
         # 3. Global State Space
         global_state_dim = (self.num_uavs * 2 +  # UAV positions (x, y) H is fixed and energy
                             self.num_uavs * 1 +  # UAV energy levels
@@ -179,7 +184,7 @@ class UAVEmergencyEnv(ParallelEnv):
         user_wk5 = int(0.20 * self.num_users)                                                 # Number of users with urgency weight 5
         user_wk2 = int(0.30 * self.num_users)                                                 # Number of users with urgency weight 2
         user_wk1 = self.num_users - user_wk5 - user_wk2                                       # Number of users with urgency weight 1
-
+        self._cumulative_reward = 0.0
         weights = ([5.0] * user_wk5) + ([2.0] * user_wk2) + ([1.0] * user_wk1)
         np.random.shuffle(weights)  # Shuffle the weights to randomize user urgency
         self.user_priority = np.array(weights)
@@ -217,6 +222,25 @@ class UAVEmergencyEnv(ParallelEnv):
         infos = {agent: {} for agent in self.agents}
         return observations, infos
     
+    def _channel_gain_bounds(self):
+        
+        def gain_compute(horizontal_distance):
+            link_distance = np.hypot(horizontal_distance, self.H) # Formula 9
+
+            elevation_angle = 180/np.pi * np.arcsin(self.H / link_distance) # Formula 10
+
+            pLoS = 1 / (1 + self.alpha_env * np.exp(-self.beta_env*(elevation_angle - self.alpha_env ))) # Formula 11
+            pNLoS = 1 - pLoS
+            
+            PLoss = 20 * np.log10 ( 4 * np.pi * self.fc * link_distance / speed_of_light )  + pLoS * self.eta_LoS + pNLoS * self.eta_NLoS #Formula 12
+            channel_gain = np.power(10,-PLoss/10)
+            return channel_gain
+        gain_max = gain_compute(0.0)
+        gain_min = gain_compute(self.D_MAX)
+        
+        return gain_max, gain_min
+
+
 
 
     def _get_local_obs(self, agent_id):
@@ -246,7 +270,6 @@ class UAVEmergencyEnv(ParallelEnv):
         """
         agent_idx = self.agent_name_to_idx[agent_id]
         MAX_WEIGHT = 5.0
-        D_MAX = np.sqrt(2 * (self.L ** 2) + (self.H ** 2))  # Maximum possible distance in the environment
         # Local Observation
 
         # Normalize UAV position [0,1]
@@ -265,7 +288,7 @@ class UAVEmergencyEnv(ParallelEnv):
         other_uav_position = np.concatenate(other_uav_position) if other_uav_position else np.array([])
 
         # Distance to other UAVs
-        distance_to_other_uavs = np.linalg.norm(self.uav_position[agent_idx] - other_uav_position.reshape(-1, 2), axis=1) / D_MAX if other_uav_position.size > 0 else np.array([])
+        distance_to_other_uavs = np.linalg.norm(self.uav_position[agent_idx] - other_uav_position.reshape(-1, 2), axis=1) / self.D_MAX if other_uav_position.size > 0 else np.array([])
 
         # Other UAV energy levels
         other_uav_energy = []
@@ -282,7 +305,7 @@ class UAVEmergencyEnv(ParallelEnv):
         close_indicies = sorted_indices[:self.max_observed_user]
         
         close_user_distance = distances[close_indicies] # Shape [max_observed_user]
-        close_user_distance_3D = np.hypot(close_user_distance, self.H) / D_MAX  # Normalize 3D distance [0,1]
+        close_user_distance_3D = np.hypot(close_user_distance, self.H) / self.D_MAX  # Normalize 3D distance [0,1]
         
         close_user_weight = self.user_priority[close_indicies] / MAX_WEIGHT  # Normalize user urgency weight [0,1]
         close_user_position = self_user_positions[close_indicies].flatten()  # User positions [0,1]
@@ -292,8 +315,8 @@ class UAVEmergencyEnv(ParallelEnv):
         # Large-scale channel gain (average of observed users)
 
         close_user_c_g = self._compute_channel_gain(agent_idx, close_indicies)
-        close_user_c_g_max,close_user_c_g_min = close_user_c_g.max(),close_user_c_g.min()
-        close_user_c_g_norm = (close_user_c_g - close_user_c_g_min) / (close_user_c_g_max - close_user_c_g_min + 1e-9) # Min -  max normalization
+        close_user_c_g_db = 10 * np.log10(close_user_c_g)
+        close_user_c_g_norm = (close_user_c_g_db - self.gain_min_db) / (self.gain_max_db - self.gain_min_db + 1e-9) # Min -  max normalization
 
         # To be continued
                 # print("Local Observation for", agent_id)
@@ -330,7 +353,7 @@ class UAVEmergencyEnv(ParallelEnv):
             close_user_position,
             close_user_c_g_norm
         ])
-        return local_obs
+        return local_obs.astype(np.float32)
     
 
     def _compute_channel_gain(self,agent_idx,user_indicies):
@@ -354,7 +377,6 @@ class UAVEmergencyEnv(ParallelEnv):
         Trả về chỉ số của K user gần nhất mà UAV agent_idx quan sát được.
         Tách riêng từ _get_local_obs để dùng chung với service-group building.
         """
-        D_MAX = np.sqrt(2 * (self.L ** 2) + (self.H ** 2))
         uav_pos_norm = self.uav_position[agent_idx] / self.L
         user_pos_norm = self.user_positions / self.L
         distances = np.linalg.norm(uav_pos_norm - user_pos_norm, axis=1)
@@ -508,7 +530,7 @@ class UAVEmergencyEnv(ParallelEnv):
             sinr = self._compute_SINR(p,b, m, served_users)      # gamma_{m,k}
             b_mk = b[m, served_users]                           # bandwidth tương ứng
             rates[served_users] = b_mk * np.log2(1 + sinr)      # a_{m,k}=1 đã đảm bảo qua served_users
-
+        rates_mbps = rates / 1e6 
         return rates
     
     def _move_uav(self, agent_idx, mov_action):
@@ -589,7 +611,7 @@ class UAVEmergencyEnv(ParallelEnv):
             self.uav_energy[m] = max(0.0, self.uav_energy[m] - E_total)  # không cho âm
             #print("UAV Energy", self.uav_energy[m])
 
-        return self.consumed_energy # Trả về năng lượng đã tiêu hao sử dụng
+        return self.consumed_energy.copy() # Trả về năng lượng đã tiêu hao sử dụng
         
     def _compute_qos_violation(self, rates):
         """Formula (32): chỉ tính cho user khẩn cấp"""
@@ -612,11 +634,12 @@ class UAVEmergencyEnv(ParallelEnv):
         return psi_bat  # shape (num_uavs,)
     
     def _compute_reward(self, a, rates, E_consumed, psi_qos, psi_col, psi_bat):
-        U_R = np.sum(self.user_priority * rates * a.sum(axis=0))  
-        # a.sum(axis=0) = 1 nếu user được phục vụ, 0 nếu không -> mask user chưa có UAV nào phục vụ
+        
+        rates_mbps = rates / 1e6  # mbps to kbps
 
-        U_E = np.sum(E_consumed)
-
+        U_R = np.sum(self.user_priority * rates_mbps)  
+        U_E = np.sum(E_consumed) / 1e3 # j to Kj
+ 
         penalty_qos = self.lambda_Q * np.sum(psi_qos)
         penalty_col = self.lambda_C * psi_col
         penalty_bat = self.lambda_B * np.sum(psi_bat)
@@ -642,7 +665,7 @@ class UAVEmergencyEnv(ParallelEnv):
             mov_action = actions[agent][0]
             speeds[agent_idx] = self._move_uav(agent_idx, mov_action)   
         a, p, b = self._resolve_association_and_resources(actions)   # gọi 1 LẦN duy nhất
-
+        self.a, self.p, self.b = a, p, b
         E_consumed = self._update_energy(a, p, speeds)   # dùng lại a, p đã tính, không tính lại
 
         rates = self._compute_achievable_rate(a, p, b)
@@ -654,13 +677,14 @@ class UAVEmergencyEnv(ParallelEnv):
         observations = {agent: self._get_local_obs(agent) for agent in self.agents}
         
         r_shared = self._compute_reward(a, rates, E_consumed, psi_qos, psi_col, psi_bat)  # (35)
+        self._cumulative_reward += r_shared
         # Trả về phần thưởng chung hoặc riêng tùy định nghĩa (Thường trong CTDE là chung)
         rewards = {agent: r_shared for agent in self.agents} 
         self.current_step += 1
         terminations = {}
         truncations = {}
         for agent in self.agents:
-            agent_idx = self.agents.index(agent)
+            agent_idx = self.agent_name_to_idx[agent]
             terminations[agent] = bool(self.uav_energy[agent_idx] <= self.E_min)
             truncations[agent] = bool(self.current_step >= self.time_slot)
 
@@ -691,45 +715,69 @@ class UAVEmergencyEnv(ParallelEnv):
             close_gains                                  # (num_users,) - cần định nghĩa lại cho hợp lý
         ])
         return global_state.astype(np.float32)
-    
+    def render(self):
+        if self.render_mode is None:
+            return None
+        if self._renderer is None:
+            from uav_render import UAVRenderer
+            self._renderer = UAVRenderer(self.L, self.render_mode)
+        return self._renderer.render_frame(
+            self.uav_position, self.uav_energy, self.E_max, self.E_min,
+            self.user_positions, self.user_priority, self.is_emergency,
+            self.a, self.current_step, self._cumulative_reward, self.agents, self.num_uavs
+    )
+
+    def close(self):
+        if self._renderer is not None:
+            self._renderer.close()
+            self._renderer = None
+
+
 if __name__ == "__main__":
 
+    # env = UAVEmergencyEnv(render_mode="human")
+    # obs, infos = env.reset(seed=42)
+
+    # print("Agents:", env.agents)
+    # print("Number of agents:", len(env.agents))
+    # print()
+
+    # for agent, ob in obs.items():
+    #     print(agent, ob.shape)
+
+    # for agent in env.agents:
+    #     obs = env._get_local_obs(agent)
+
+    #     print(agent)
+    #     print(obs.shape)
+    #     print(env.observation_space(agent).shape)
+
+    #     assert env.observation_space(agent).contains(obs.astype(np.float32))
+
+
+    # for step in range(env.time_slot):
+    #     if not env.agents:
+    #         break
+    #     actions = {
+    #         agent: env.action_space(agent).sample()
+    #         for agent in env.agents
+    #     }
+
+    #     obs, rewards, terminations, truncations, infos = env.step(actions)
+
+    #     print(f"\n========== STEP {step} ==========")
+
+    #     for agent in env.agents:
+    #         print(f"\n{agent}")
+    #         print("Action :", actions[agent])
+    #         print("Reward :", rewards[agent])
+    #         print("Obs :", obs[agent])
+    #         print("Obs shape :", obs[agent].shape)
+    #         print("Global Observation", env.state())
     env = UAVEmergencyEnv(render_mode="human")
     obs, infos = env.reset(seed=42)
-
-    print("Agents:", env.agents)
-    print("Number of agents:", len(env.agents))
-    print()
-
-    for agent, ob in obs.items():
-        print(agent, ob.shape)
-
-    for agent in env.agents:
-        obs = env._get_local_obs(agent)
-
-        print(agent)
-        print(obs.shape)
-        print(env.observation_space(agent).shape)
-
-        assert env.observation_space(agent).contains(obs.astype(np.float32))
-
-
-    for step in range(env.time_slot):
-        if not env.agents:
-            break
-        actions = {
-            agent: env.action_space(agent).sample()
-            for agent in env.agents
-        }
-
-        obs, rewards, terminations, truncations, infos = env.step(actions)
-
-        print(f"\n========== STEP {step} ==========")
-
-        for agent in env.agents:
-            print(f"\n{agent}")
-            print("Action :", actions[agent])
-            print("Reward :", rewards[agent])
-            print("Obs :", obs[agent])
-            print("Obs shape :", obs[agent].shape)
-            print("Global Observation", env.state())
+    for _ in range(100):
+        actions = {agent: env.action_space(agent).sample() for agent in env.agents}
+        env.step(actions)
+        env.render()   # cửa sổ matplotlib phải update liên tục, không mở cửa sổ mới mỗi lần
+    env.close()
