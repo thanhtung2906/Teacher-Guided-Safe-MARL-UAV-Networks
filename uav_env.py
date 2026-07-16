@@ -3,7 +3,7 @@ from gymnasium.spaces import Box, Discrete, MultiDiscrete
 import numpy as np
 import functools
 from scipy.constants import speed_of_light 
-
+from gymnasium.utils import seeding
 
 """ According to the article: Experiment Setup
 
@@ -50,7 +50,7 @@ class UAVEmergencyEnv(ParallelEnv):
         self.E_min = 5000  # Minimum energy threshold for UAVs (Joules)
         
         
-        self.time_slot = 100 # Mission duration divided into T time slots
+        self.time_slot = 200 # Mission duration divided into T time slots
         self.delta_T = 1 # Each time slot duration
         
         
@@ -91,7 +91,7 @@ class UAVEmergencyEnv(ParallelEnv):
         self._cumulative_reward = 0.0
         self.consumed_energy = np.zeros(num_uavs)
         # QoS threshold cho user khẩn cấp - dùng trong (31h), (32)
-        self.R_min_emg = 0.1   # bps, giá trị cụ thể bạn cần chọn theo thực nghiệm
+        self.R_min_emg = 0.1   # kbps, giá trị cụ thể bạn cần chọn theo thực nghiệm
 
         # Đánh dấu user nào là "khẩn cấp" (K_emg ⊆ K)
         self.is_emergency = None  # sẽ set trong reset(), ví dụ user có weight=5
@@ -174,19 +174,20 @@ class UAVEmergencyEnv(ParallelEnv):
         """
         self.agents = self.possible_agents[:]
 
-        if seed is not None:
-            np.random.seed(seed)
-        
+        self.np_random, seed = seeding.np_random(seed)
         # Initialize the environment state 
         # User positions are randomly distributed in the environment
-        self.user_positions = np.random.uniform(0, self.L, size=(self.num_users, 2)) \
+        self.user_positions = self.np_random.uniform(0, self.L, size=(self.num_users, 2)) 
 
+        # if seed is not None:
+        #     for agent in self.possible_agents:
+        #         self.action_space(agent).seed(seed)
         user_wk5 = int(0.20 * self.num_users)                                                 # Number of users with urgency weight 5
         user_wk2 = int(0.30 * self.num_users)                                                 # Number of users with urgency weight 2
         user_wk1 = self.num_users - user_wk5 - user_wk2                                       # Number of users with urgency weight 1
         self._cumulative_reward = 0.0
         weights = ([5.0] * user_wk5) + ([2.0] * user_wk2) + ([1.0] * user_wk1)
-        np.random.shuffle(weights)  # Shuffle the weights to randomize user urgency
+        self.np_random.shuffle(weights)  # Shuffle the weights to randomize user urgency
         self.user_priority = np.array(weights)
         self.is_emergency = (self.user_priority == 5.0)
         # Initialize UAV positions randomly within the environment
@@ -203,7 +204,7 @@ class UAVEmergencyEnv(ParallelEnv):
         #             self.uav_position[i] = position
         for i in range(self.num_uavs):
             while True:
-                position = np.random.uniform(0, self.L, size=2)
+                position = self.np_random.uniform(0, self.L, size=2)
                 if all(np.linalg.norm(position - self.uav_position[j]) >= self.d_min for j in range(i)):
                     self.uav_position[i] = position
                     break
@@ -223,8 +224,9 @@ class UAVEmergencyEnv(ParallelEnv):
         return observations, infos
     
     def _channel_gain_bounds(self):
-        
+        D_MAX_horizontal = self.L * np.sqrt(2)
         def gain_compute(horizontal_distance):
+            
             link_distance = np.hypot(horizontal_distance, self.H) # Formula 9
 
             elevation_angle = 180/np.pi * np.arcsin(self.H / link_distance) # Formula 10
@@ -236,11 +238,9 @@ class UAVEmergencyEnv(ParallelEnv):
             channel_gain = np.power(10,-PLoss/10)
             return channel_gain
         gain_max = gain_compute(0.0)
-        gain_min = gain_compute(self.D_MAX)
+        gain_min = gain_compute(D_MAX_horizontal)
         
         return gain_max, gain_min
-
-
 
 
     def _get_local_obs(self, agent_id):
@@ -356,14 +356,15 @@ class UAVEmergencyEnv(ParallelEnv):
         return local_obs.astype(np.float32)
     
 
-    def _compute_channel_gain(self,agent_idx,user_indicies):
+    def _compute_channel_gain(self,agent_idx,user_indicies): #TODO: Chuyển sang sử dụng cache, tính ra ma trận compute gain của toàn bộ uav đến toàn bộ user ở mỗi step
+
         
         horizontal_distance = np.linalg.norm(self.uav_position[agent_idx] - self.user_positions[user_indicies],axis = 1) 
-        link_distance = np.hypot(horizontal_distance, self.H) # Formula 9
+        link_distance = np.hypot(horizontal_distance, self.H) # Formula (9)
 
-        elevation_angle = 180/np.pi * np.arcsin(self.H / link_distance) # Formula 10
+        elevation_angle = 180/np.pi * np.arcsin(self.H / link_distance) # Formula (10)
 
-        pLoS = 1 / (1 + self.alpha_env * np.exp(-self.beta_env*(elevation_angle - self.alpha_env ))) # Formula 11
+        pLoS = 1 / (1 + self.alpha_env * np.exp(-self.beta_env*(elevation_angle - self.alpha_env ))) # Formula (11)
         pNLoS = 1 - pLoS
         
         PLoss = 20 * np.log10 ( 4 * np.pi * self.fc * link_distance / speed_of_light )  + pLoS * self.eta_LoS + pNLoS * self.eta_NLoS #Formula 12
@@ -371,7 +372,16 @@ class UAVEmergencyEnv(ParallelEnv):
         channel_gain = np.power(10,-PLoss/10)
         
         return channel_gain
-    
+    def _compute_channel_gain_matrix(self):
+        """
+        Tính channel gain giữa TẤT CẢ UAV và TẤT CẢ user.
+        Trả về: gain_matrix, shape (num_uavs, num_users)
+        """
+        all_users = np.arange(self.num_users)
+        gain_matrix = np.zeros((self.num_uavs, self.num_users))
+        for m in range(self.num_uavs):
+            gain_matrix[m, :] = self._compute_channel_gain(m, all_users)
+        return gain_matrix
     def _get_nearest_user_indices(self, agent_idx):
         """
         Trả về chỉ số của K user gần nhất mà UAV agent_idx quan sát được.
@@ -615,7 +625,7 @@ class UAVEmergencyEnv(ParallelEnv):
         
     def _compute_qos_violation(self, rates):
         """Formula (32): chỉ tính cho user khẩn cấp"""
-        emg_rates = rates[self.is_emergency]
+        emg_rates = rates[self.is_emergency] / 1e6
         psi_qos = np.maximum(self.R_min_emg - emg_rates, 0.0)
         return psi_qos  # shape (num_emg_users,)
 
@@ -635,7 +645,7 @@ class UAVEmergencyEnv(ParallelEnv):
     
     def _compute_reward(self, a, rates, E_consumed, psi_qos, psi_col, psi_bat):
         
-        rates_mbps = rates / 1e6  # mbps to kbps
+        rates_mbps = rates / 1e6  #  bps -> Mbps
 
         U_R = np.sum(self.user_priority * rates_mbps)  
         U_E = np.sum(E_consumed) / 1e3 # j to Kj
@@ -703,16 +713,16 @@ class UAVEmergencyEnv(ParallelEnv):
 
 
     def state(self):
-        close_gains = np.array([
-            self._compute_channel_gain(0, np.arange(self.num_users))
-        ]).flatten()  # ví dụ đơn giản, bạn cần quyết định channel gain tính theo UAV nào / trung bình ra sao
+        gain_matrix = self._compute_channel_gain_matrix()          # (num_uavs, num_users)
+        gain_matrix_db = 10 * np.log10(gain_matrix + 1e-20)
+        gain_norm = (gain_matrix_db - self.gain_min_db) / (self.gain_max_db - self.gain_min_db + 1e-9)
 
         global_state = np.concatenate([
-            self.uav_position.flatten() / self.L,      # (num_uavs*2,)
-            self.uav_energy / self.E_max,               # (num_uavs,)
-            self.user_positions.flatten() / self.L,     # (num_users*2,)
-            self.user_priority / 5.0,                    # (num_users,)
-            close_gains                                  # (num_users,) - cần định nghĩa lại cho hợp lý
+            self.uav_position.flatten() / self.L,
+            self.uav_energy / self.E_max,
+            self.user_positions.flatten() / self.L,
+            self.user_priority / 5.0,
+            gain_norm.flatten()                                     # (num_uavs*num_users,)
         ])
         return global_state.astype(np.float32)
     def render(self):
@@ -776,8 +786,14 @@ if __name__ == "__main__":
     #         print("Global Observation", env.state())
     env = UAVEmergencyEnv(render_mode="human")
     obs, infos = env.reset(seed=42)
-    for _ in range(100):
+    for t in range(200):
+        truncations = False
         actions = {agent: env.action_space(agent).sample() for agent in env.agents}
-        env.step(actions)
+        observations, rewards, terminations, truncations, infos = env.step(actions)
+        print("Step",t)
+        print("Observation: ", observations )
+        print("Reward: ",rewards )
+        print("Infos: ", infos)
+        print("Global State:", env.state())
         env.render()   # cửa sổ matplotlib phải update liên tục, không mở cửa sổ mới mỗi lần
     env.close()
