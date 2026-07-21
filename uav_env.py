@@ -26,7 +26,6 @@ The environment is designed to simulate a UAV emergency communication scenario.
 """
 
 
-
 class UAVEmergencyEnv(ParallelEnv):
     metadata = {'render_modes': ['human'], "name": "uav_emergency_v0"}
 
@@ -50,7 +49,7 @@ class UAVEmergencyEnv(ParallelEnv):
         self.E_min = 5000  # Minimum energy threshold for UAVs (Joules)
         
         
-        self.time_slot = 200 # Mission duration divided into T time slots
+        self.time_slot = 100 # Mission duration divided into T time slots
         self.delta_T = 1 # Each time slot duration
         
         
@@ -84,9 +83,9 @@ class UAVEmergencyEnv(ParallelEnv):
         self.noise_PSD = -174 # Noise PSD dBm/Hz
 
         # Reward coefficients - Formula (35)
-        self.lambda_E = 30   # hệ số phạt năng lượng (cần scale vì E tính bằng J, R tính bằng bps)
+        self.lambda_E = 20   # hệ số phạt năng lượng (cần scale vì E tính bằng J, R tính bằng bps)
         self.lambda_Q = 100    # hệ số phạt vi phạm QoS khẩn cấp
-        self.lambda_C = 30    # hệ số phạt va chạm
+        self.lambda_C = 200    # hệ số phạt va chạm
         self.lambda_B = 30    # hệ số phạt pin cạn
         self._cumulative_reward = 0.0
         self.consumed_energy = np.zeros(num_uavs)
@@ -113,7 +112,7 @@ class UAVEmergencyEnv(ParallelEnv):
                             self.num_uavs * 1 +  # UAV energy levels
                             self.num_users * 2 +  # User positions (x, y)
                             self.num_users * 1 +   # User urgency weight
-                            self.num_users * 1)  # large-scale channel gain for each user
+                            self.num_users * self.num_uavs)  # large-scale channel gain for each user
 
         # s[t] 
         self.state_space = Box(low=-np.inf, high=np.inf, shape=(global_state_dim,), dtype=np.float32) 
@@ -630,32 +629,52 @@ class UAVEmergencyEnv(ParallelEnv):
         return psi_qos  # shape (num_emg_users,)
 
     def _compute_collision_violation(self):
-        """Formula (33): với mọi cặp UAV m != j"""
+        """Formula (33): CHỈ tính cho các UAV CÒN SỐNG để tránh trừ điểm vô cực"""
         psi_col = 0.0
-        for m in range(self.num_uavs):
-            for j in range(m + 1, self.num_uavs):   # chỉ tính mỗi cặp 1 lần, x2 sau
-                dist = np.linalg.norm(self.uav_position[m] - self.uav_position[j])
-                psi_col += 2 * max(self.d_min - dist, 0.0)  # x2 vì sum m!=j đếm cả (m,j) và (j,m)
+        # Lấy index của các agent hiện đang còn active
+        alive_indices = [self.agent_name_to_idx[a] for a in self.agents]
+        
+        for i in range(len(alive_indices)):
+            for j in range(i + 1, len(alive_indices)):
+                m = alive_indices[i]
+                n = alive_indices[j]
+                dist = np.linalg.norm(self.uav_position[m] - self.uav_position[n])
+                psi_col += 2 * max(self.d_min - dist, 0.0) 
         return psi_col
 
     def _compute_battery_violation(self):
-        """Formula (34)"""
-        psi_bat = np.maximum(self.E_min - self.uav_energy, 0.0)
+        """Formula (34): CHỈ tính cho các UAV CÒN SỐNG"""
+        psi_bat = np.zeros(self.num_uavs)
+        for agent in self.agents:
+            m = self.agent_name_to_idx[agent]
+            psi_bat[m] = max(self.E_min - self.uav_energy[m], 0.0)
         return psi_bat  # shape (num_uavs,)
     
     def _compute_reward(self, a, rates, E_consumed, psi_qos, psi_col, psi_bat):
-        
-        rates_mbps = rates / 1e6  #  bps -> Mbps
+        rates_mbps = rates / 1e6  # bps -> Mbps
 
+        # Điểm thưởng từ việc phục vụ (Thường dao động từ 10 -> 50)
         U_R = np.sum(self.user_priority * rates_mbps)  
         U_E = np.sum(E_consumed) / 1e3 # j to Kj
  
         penalty_qos = self.lambda_Q * np.sum(psi_qos)
-        penalty_col = self.lambda_C * psi_col
-        penalty_bat = self.lambda_B * np.sum(psi_bat)
+        penalty_col = self.lambda_C * (psi_col / self.d_min)
+        penalty_bat = self.lambda_B * np.sum(psi_bat)/ 1e3
 
+        # R thô (Có thể từ vài chục đến âm hàng nghìn)
         r = U_R - self.lambda_E * U_E - penalty_qos - penalty_col - penalty_bat
-        return r
+        
+        # ==========================================
+        # KỸ THUẬT REWARD SCALING & CLIPPING CHO PPO
+        # ==========================================
+        # 1. Thu nhỏ biên độ: Chia cho 100 để các thành phần thưởng/phạt về quanh mức -1.0 đến 1.0
+        r_scaled = r / 100.0 
+        
+        # 2. Cắt ngọn (Clipping): Không cho Reward vượt quá [-10, 10]
+        # Ngăn chặn hoàn toàn hiện tượng Value Loss bùng nổ
+        r_clipped = np.clip(r_scaled, -100.0, 100.0) 
+        
+        return float(r_clipped)
 
     def step(self, actions):
         # Execute actions for all UAVs simultaneously
@@ -682,7 +701,7 @@ class UAVEmergencyEnv(ParallelEnv):
 
         psi_qos = self._compute_qos_violation(rates)             # (32)
         psi_col = self._compute_collision_violation()             # (33)
-        psi_bat = self._compute_battery_violation( )                # (34)
+        psi_bat = self._compute_battery_violation()                # (34)
 
         observations = {agent: self._get_local_obs(agent) for agent in self.agents}
         
@@ -709,7 +728,6 @@ class UAVEmergencyEnv(ParallelEnv):
         ]
 
         return observations, rewards, terminations, truncations, infos
-
 
 
     def state(self):
