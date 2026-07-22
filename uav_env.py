@@ -174,6 +174,8 @@ class UAVEmergencyEnv(ParallelEnv):
         self.agents = self.possible_agents[:]
 
         self.np_random, seed = seeding.np_random(seed)
+        if self._renderer is not None:
+            self._renderer.reset_trail()
         # Initialize the environment state 
         # User positions are randomly distributed in the environment
         self.user_positions = self.np_random.uniform(0, self.L, size=(self.num_users, 2)) 
@@ -652,17 +654,29 @@ class UAVEmergencyEnv(ParallelEnv):
     
     def _compute_reward(self, a, rates, E_consumed, psi_qos, psi_col, psi_bat):
         rates_mbps = rates / 1e6  # bps -> Mbps
-
+        distance_reward = 0.0
         # Điểm thưởng từ việc phục vụ (Thường dao động từ 10 -> 50)
         U_R = np.sum(self.user_priority * rates_mbps)  
         U_E = np.sum(E_consumed) / 1e3 # j to Kj
- 
+        for agent in self.agents:
+            m = self.agent_name_to_idx[agent]
+            served_users = np.where(a[m, :] == 1)[0]
+            if len(served_users) > 0:
+            # Tính khoảng cách trung bình từ UAV đến nhóm user đang phục vụ
+                avg_dist = np.mean(np.linalg.norm(self.uav_position[m] - self.user_positions[served_users], axis=1))
+            
+            # Thưởng tỷ lệ nghịch với khoảng cách (Càng gần điểm càng cao)
+            # Chia cho self.D_MAX để chuẩn hóa về [0, 1]
+                distance_reward = 1.0 - (avg_dist / self.D_MAX)
+            
+            # Nhân với hệ số (ví dụ 10) để cân bằng với U_R
+                distance_reward *= 30.0
         penalty_qos = self.lambda_Q * np.sum(psi_qos)
         penalty_col = self.lambda_C * (psi_col / self.d_min)
         penalty_bat = self.lambda_B * np.sum(psi_bat)/ 1e3
 
         # R thô (Có thể từ vài chục đến âm hàng nghìn)
-        r = U_R - self.lambda_E * U_E - penalty_qos - penalty_col - penalty_bat
+        r = U_R + distance_reward - self.lambda_E * U_E - penalty_qos - penalty_col - penalty_bat
         
         # ==========================================
         # KỸ THUẬT REWARD SCALING & CLIPPING CHO PPO
@@ -748,7 +762,7 @@ class UAVEmergencyEnv(ParallelEnv):
             return None
         if self._renderer is None:
             from uav_render import UAVRenderer
-            self._renderer = UAVRenderer(self.L, self.render_mode)
+            self._renderer = UAVRenderer(self.L, self.render_mode, self.num_uavs, trail_length=30)
         return self._renderer.render_frame(
             self.uav_position, self.uav_energy, self.E_max, self.E_min,
             self.user_positions, self.user_priority, self.is_emergency,
@@ -804,7 +818,8 @@ if __name__ == "__main__":
     #         print("Global Observation", env.state())
     env = UAVEmergencyEnv(render_mode="human")
     obs, infos = env.reset(seed=42)
-    for t in range(200):
+    total_reward = 0.0
+    for t in range(100):
         truncations = False
         actions = {agent: env.action_space(agent).sample() for agent in env.agents}
         observations, rewards, terminations, truncations, infos = env.step(actions)
@@ -813,5 +828,7 @@ if __name__ == "__main__":
         print("Reward: ",rewards )
         print("Infos: ", infos)
         print("Global State:", env.state())
+        total_reward =+ rewards
         env.render()   # cửa sổ matplotlib phải update liên tục, không mở cửa sổ mới mỗi lần
+    print("Total reward:")
     env.close()

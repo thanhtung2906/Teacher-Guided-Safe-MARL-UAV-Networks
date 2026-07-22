@@ -1,9 +1,3 @@
-"""
-MAPPO tối giản - 1 process (không SuperSuit), centralized critic + 3-head actor.
-Mục tiêu: có kết quả chạy được để nộp, KHÔNG kỳ vọng hội tụ tốt trong thời gian ngắn.
-
-Chạy: python train_mappo.py
-"""
 import numpy as np
 import torch
 import torch.nn as nn
@@ -20,12 +14,13 @@ SEED = 0
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.2
-LR = 3e-4
+ACTOR_LR = 3e-4
+CRITIC_LR = 1e-3
 VALUE_COEF = 0.5
-ENTROPY_COEF = 0.01
+ENTROPY_COEF = 0.05
 EPOCHS_PER_UPDATE = 10
 MINIBATCH_SIZE = 256
-NUM_UPDATES = 200       # tăng lên nếu còn thời gian, giảm nếu cần kết quả gấp
+NUM_UPDATES = 3000       
 MAX_GRAD_NORM = 0.5
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -40,12 +35,12 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Actor(nn.Module):
-    """Decentralized, tham số dùng chung cho mọi UAV (parameter sharing)."""
-    def __init__(self, obs_dim, hidden=256):
+    """Decentralized UAV (parameter sharing)."""
+    def __init__(self, obs_dim, hidden=128):
         super().__init__()
         self.trunk = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, hidden)), nn.Tanh(),
-            layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
+            layer_init(nn.Linear(obs_dim, hidden)), nn.ReLU(),
+            layer_init(nn.Linear(hidden, hidden)), nn.ReLU(),
         )
         self.head_move = layer_init(nn.Linear(hidden, 9), std=0.01)
         self.head_srv = layer_init(nn.Linear(hidden, 4), std=0.01)
@@ -70,12 +65,12 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    """Centralized, input = global state() của toàn hệ thống."""
+    """Centralized, input = global state()"""
     def __init__(self, state_dim, hidden=256):
         super().__init__()
         self.net = nn.Sequential(
-            layer_init(nn.Linear(state_dim, hidden)), nn.Tanh(),
-            layer_init(nn.Linear(hidden, hidden)), nn.Tanh(),
+            layer_init(nn.Linear(state_dim, hidden)), nn.ReLU(),
+            layer_init(nn.Linear(hidden, hidden)), nn.ReLU(),
             layer_init(nn.Linear(hidden, 1), std=1.0),
         )
 
@@ -84,7 +79,7 @@ class Critic(nn.Module):
 
 
 def compute_gae(rewards, values, dones, gamma, lam):
-    """rewards, values, dones: 1D array shape (T,). values phải có T+1 phần tử (bootstrap)."""
+    """rewards, values, dones: 1D array shape (T,). values  có T+1 phần tử (bootstrap)."""
     T = len(rewards)
     advantages = np.zeros(T, dtype=np.float32)
     last_gae = 0.0
@@ -173,7 +168,7 @@ def collect_rollout(env, actor, critic):
     }
 
 
-def ppo_update(actor, critic, opt, rollout):
+def ppo_update(actor, critic, actor_opt, critic_opt, rollout):
     obs = torch.as_tensor(rollout["obs"], dtype=torch.float32, device=DEVICE)          # (T,M,obs_dim)
     state = torch.as_tensor(rollout["state"], dtype=torch.float32, device=DEVICE)      # (T,state_dim)
     action = torch.as_tensor(rollout["action"], dtype=torch.long, device=DEVICE)       # (T,M,3)
@@ -206,21 +201,31 @@ def ppo_update(actor, critic, opt, rollout):
 
             surr1 = ratio * mb_adv
             surr2 = torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * mb_adv
+            
+            # --- 1. Tính toán và cập nhật ACTOR ---
             policy_loss = -(torch.min(surr1, surr2) * mb_mask).sum() / mb_mask.sum().clamp(min=1)
             entropy_loss = -(entropy * mb_mask).sum() / mb_mask.sum().clamp(min=1)
+            actor_loss = policy_loss + ENTROPY_COEF * entropy_loss
+            
+            actor_opt.zero_grad()
+            actor_loss.backward()
+            nn.utils.clip_grad_norm_(actor.parameters(), MAX_GRAD_NORM)
+            actor_opt.step()
 
+            # --- 2. Tính toán và cập nhật CRITIC ---
             mb_state = state[mb_idx]
             mb_returns = returns[mb_idx]
             new_value = critic(mb_state)
+            
             value_loss = ((new_value - mb_returns) ** 2).mean()
+            critic_loss = VALUE_COEF * value_loss
+            
+            critic_opt.zero_grad()
+            critic_loss.backward()
+            nn.utils.clip_grad_norm_(critic.parameters(), MAX_GRAD_NORM)
+            critic_opt.step()
 
-            loss = policy_loss + VALUE_COEF * value_loss + ENTROPY_COEF * entropy_loss
-
-            opt.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(list(actor.parameters()) + list(critic.parameters()), MAX_GRAD_NORM)
-            opt.step()
-
+            # --- Ghi nhận thống kê ---
             with torch.no_grad():
                 approx_kl = ((ratio - 1) - torch.log(ratio)).mean().item()
                 clip_frac = ((ratio - 1.0).abs() > CLIP_EPS).float().mean().item()
@@ -239,7 +244,7 @@ def main():
     obs_dim = env.observation_space("uav_0").shape[0]
     state_dim = env.state_space.shape[0]
 
-    # --- Sanity assertion: bắt lỗi shape ngay lập tức thay vì để lỗi âm thầm giữa training ---
+    # --- Sanity assertion: ---
     obs0, _ = env.reset(seed=SEED)
     assert obs0["uav_0"].shape[0] == obs_dim, "obs_dim mismatch - kiểm tra lại observation_space"
     assert env.state().shape[0] == state_dim, "state_dim mismatch - kiểm tra lại state_space"
@@ -247,7 +252,8 @@ def main():
 
     actor = Actor(obs_dim).to(DEVICE)
     critic = Critic(state_dim).to(DEVICE)
-    opt = torch.optim.Adam(list(actor.parameters()) + list(critic.parameters()), lr=LR)
+    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=ACTOR_LR, eps=1e-5)
+    critic_optimizer = torch.optim.Adam(critic.parameters(), lr=CRITIC_LR, eps=1e-5)
 
     history = {"episode_reward": [], "U_R_mean": [], "psi_qos_mean": [], "psi_col_mean": [],
                "psi_bat_mean": [], "policy_loss": [], "value_loss": [], "entropy": [],
@@ -255,7 +261,7 @@ def main():
 
     for update in range(1, NUM_UPDATES + 1):
         rollout = collect_rollout(env, actor, critic)
-        stats = ppo_update(actor, critic, opt, rollout)
+        stats = ppo_update(actor, critic, actor_optimizer, critic_optimizer, rollout)
 
         ep_reward = float(rollout["reward"].sum())
         info_log = rollout["info_log"]
@@ -274,7 +280,7 @@ def main():
 
     torch.save({"actor": actor.state_dict(), "critic": critic.state_dict()}, "mappo_checkpoint.pt")
 
-    # --- Plots để nộp báo cáo ---
+    # --- Plots  ---
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     axes[0, 0].plot(history["episode_reward"]); axes[0, 0].set_title("Episode reward")
     axes[0, 1].plot(history["policy_loss"]); axes[0, 1].set_title("Policy loss")
@@ -282,10 +288,10 @@ def main():
     axes[1, 0].plot(history["entropy"]); axes[1, 0].set_title("Entropy")
     axes[1, 1].plot(history["psi_qos_mean"], label="QoS"); axes[1, 1].plot(history["psi_col_mean"], label="Collision")
     axes[1, 1].plot(history["psi_bat_mean"], label="Battery"); axes[1, 1].set_title("Safety violations"); axes[1, 1].legend()
-    axes[1, 2].plot(history["n_steps"]); axes[1, 2].set_title("Episode length (steps sống sót)")
+    axes[1, 2].plot(history["n_steps"]); axes[1, 2].set_title("Episode length (steps)")
     plt.tight_layout()
     plt.savefig("training_curves.png", dpi=120)
-    print("\nĐã lưu: mappo_checkpoint.pt, training_curves.png")
+    print("\nSaved: mappo_checkpoint.pt, training_curves.png")
 
 
 if __name__ == "__main__":

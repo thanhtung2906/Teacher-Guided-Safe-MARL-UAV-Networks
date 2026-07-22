@@ -1,15 +1,19 @@
 import numpy as np
+from collections import deque
 
 
 class UAVRenderer:
-    """Renderer tách riêng khỏi env. Lazy-init matplotlib, reuse 1 figure."""
+    """Renderer tach rieng khoi env. Lazy-init matplotlib, reuse 1 figure."""
 
-    def __init__(self, L, render_mode="human"):
+    def __init__(self, L, render_mode="human", num_uavs=3, trail_length=100):
         self.L = L
         self.render_mode = render_mode
         self.fig = None
         self.ax = None
         self.plt = None
+        # --- Trajectory trail: luu lich su vi tri gan nhat cua tung UAV ---
+        self.trail_length = trail_length
+        self.trails = [deque(maxlen=trail_length) for _ in range(num_uavs)]
 
     def _ensure_init(self):
         if self.fig is not None:
@@ -28,10 +32,20 @@ class UAVRenderer:
         if self.render_mode == "human":
             plt.ion()
 
+    def reset_trail(self):
+        """Goi ham nay moi khi env.reset() de khong dinh vet cua episode truoc."""
+        for trail in self.trails:
+            trail.clear()
+
     def render_frame(self, uav_position, uav_energy, E_max, E_min,
                       user_positions, user_priority, is_emergency,
                       association, step, cumulative_reward, active_agents, num_uavs):
         self._ensure_init()
+
+        # Neu so UAV thay doi (khong nen xay ra, nhung phong ho) -> resize trails
+        if len(self.trails) != num_uavs:
+            self.trails = [deque(maxlen=self.trail_length) for _ in range(num_uavs)]
+
         self.ax.clear()
         self.ax.set_xlim(0, self.L)
         self.ax.set_ylim(0, self.L)
@@ -53,8 +67,33 @@ class UAVRenderer:
                               [uav_position[m, 1], user_positions[k, 1]],
                               color="gray", linewidth=0.6, alpha=0.5, zorder=1)
 
-        # --- UAV + energy bar ---
         uav_colors = ["green", "orange", "purple", "brown", "teal"]
+
+        # --- Cap nhat trail: them vi tri hien tai vao lich su cua tung UAV ---
+        for m in range(num_uavs):
+            alive = f"uav_{m}" in active_agents
+            if alive:
+                self.trails[m].append(uav_position[m].copy())
+            # Neu UAV da chet, KHONG them diem moi -> trail dung lai dung cho vi tri cuoi
+
+        # --- Ve trail: mo dan theo thoi gian (cang cu cang mo), cung mau UAV ---
+        for m in range(num_uavs):
+            trail = self.trails[m]
+            if len(trail) < 2:
+                continue
+            c = uav_colors[m % len(uav_colors)]
+            n = len(trail)
+            for i in range(n - 1):
+                # alpha tang dan tu diem cu (mo) den diem moi (net hon)
+                alpha =  0.5 + 0.5 * (i / max(n - 1, 1)) #0.08
+                self.ax.plot(
+                    [trail[i][0], trail[i + 1][0]],
+                    [trail[i][1], trail[i + 1][1]],
+                    color=c, linewidth=2.0, alpha=alpha, zorder=1.5,
+                    solid_capstyle="round",
+                )
+
+        # --- UAV + energy bar ---
         for m in range(num_uavs):
             alive = f"uav_{m}" in active_agents
             c = uav_colors[m % len(uav_colors)]
